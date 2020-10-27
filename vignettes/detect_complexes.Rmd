@@ -1,0 +1,118 @@
+---
+title: "Detecting assembled protein complexes in a CF-MS experiment"
+author: "--"
+output:
+  rmarkdown::html_document:
+    theme: yeti
+---
+
+```{r setup, include=FALSE, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE, root.dir = "~/git/PrInCE-vignettes")
+knitr::opts_knit$set(root.dir = "~/git/PrInCE-vignettes")
+options(stringsAsFactors = F)
+suppressWarnings(suppressPackageStartupMessages({
+  library(tidyverse)
+  library(magrittr)
+  library(PrInCE)
+}))
+```
+
+```{r echo = FALSE, include=FALSE, message=FALSE, warning=FALSE}
+source("R/theme.R")
+```
+
+This vignette demonstrates the application of the PrInCE function `detect_complexes` to identify assembled protein complexes in CF-MS data from two different compartments: the cytosol (fractionated using size exclusion chromatography, SEC) and the mitochondria (fractionated using blue native polyacrylamide gel electrophoresis, BN-PAGE). 
+The data is obtained from Scott et al., _Molecular Systems Biology_ 2017, doi: 10.15252/msb.20167067. 
+
+First, we will load the data from Scott et al.
+This was obtained from the supplementary information of the original publication and pre-processed using the script in `R/preprocessing/preprocess-Scott2017.R`. 
+
+```{r}
+chroms = readRDS("data/Scott2017/chromatograms.rds")
+names(chroms)
+```
+
+We will subset to analyze only the unstimulated replicates.
+
+```{r}
+keep = grepl("unstimulated", names(chroms))
+chroms %<>% extract(keep)
+names(chroms)
+```
+
+To perform this analysis, we also need a set of known protein complexes to test for the presence of.
+For the purpose of this analysis, we will use protein complexes from the [CORUM](http://mips.helmholtz-muenchen.de/corum/) database (Giurgiu et al., _Nucleic Acids Research_ 2019, doi: 10.1093/nar/gky973), which have been preprocessed using the script at `R/preprocessing/preprocess-CORUM.R`. 
+
+```{r}
+complexes = readRDS("data/CORUM/complexes.rds")
+head(names(complexes))
+```
+
+To identify protein complexes that display a significant co-elution signature, we now need to run the `detect_complexes` function on each CF-MS chromatogram matrix.
+This function implements a statistical test adapted from one proposed by Tan et al. for the analysis of thermal proximity co-aggregation data (_Science_ 2018, doi: 10.1126/science.aan0346).
+Briefly, for each protein complex with at least three subunits represented in the matrix, we calculate the median Pearson correlation between all subunits.
+Then, we shuffle the protein complexes 100 times and re-calculate the median Pearson correlation between all subunits for random complexes, to determine the random expectation for a protein complex with the same number of subunits.
+
+
+```{r warning=FALSE}
+set.seed(0)
+results = map(chroms, ~ detect_complexes(., complexes) %>%
+                extract(!is.na(.)) %>%
+                as.tibble(rownames = 'complex') %>%
+                dplyr::rename(z_score = value))
+str(results)
+```
+
+This returns, for each CF-MS experiment, a list of complexes with the z-score of the median intra-complex Pearson correlation relative to random complexes of equivalent size. 
+
+`detect_complexes` has several parameters that are worth briefly discussing. 
+By default, `detect_complexes` will calculate the median correlation for 100 randomly shuffled complexes; this number can be increased or decreased using the `bootstraps` argument.
+Pairs of proteins in the same complex that were not detected in at least 10 overlapping fractions will not be considered, to minimize the impact of poorly-quantified subunits on the results; this number can be increased or decreased using the `min_pairs` argument
+The Pearson correlation is used by default as the test statistic to quantify co-elution, but this can optionally be replaced by the Euclidean distance with `method = 'euclidean'`. 
+Last, the progress bar can be disabled by setting `progress = FALSE`. 
+
+We can obtain a visual overview of the differences plot these results as a heatmap, keeping only protein complexes with a significant elution score in at least one replicate (defined here as z $\geq$ 1.96):
+
+```{r fig.align='center', fig.width=1.75, fig.height=3.5, warning=FALSE}
+# convert to tidy data frame and 
+df = bind_rows(results, .id = 'replicate') %>%
+  group_by(complex) %>%
+  filter(sum(z_score >= 1.96) > 0) %>%
+  ungroup()
+
+# convert to a matrix to cluster rows and columns
+mat = df %>%
+  spread(complex, z_score) %>%
+  column_to_rownames('replicate') %>%
+  as.matrix() %>%
+  # replace missing values with zeroes
+  replace_na(0)
+clust_complexes = hclust(dist(t(mat)))
+clust_replicates = hclust(dist(mat))
+complex_levels = with(clust_complexes, labels[order])
+replicate_levels = with(clust_replicates, labels[order])
+
+# finally, plot the heatmap
+pal = jdb_palette("china_sunset") %>% colorRampPalette() %>% do.call(list(100))
+p = mat %>%
+  reshape2::melt(varnames = c('replicate', 'complex'), value.name = 'z_score',
+                 as.is = TRUE) %>%
+  mutate(complex = factor(complex, levels = complex_levels),
+         replicate = factor(replicate, levels = replicate_levels), 
+         # cap z-scores at 5
+         z_score = winsorize(z_score, c(0, 5))) %>%
+  ggplot(aes(x = replicate, y = complex, fill = z_score)) +
+  geom_tile() +
+  scale_y_discrete('Complex', expand = c(0, 0)) +
+  scale_x_discrete('', expand = c(0, 0)) +
+  scale_fill_gradientn(colours = pal, breaks = c(0, 5)) +
+  guides(fill = guide_colorbar("z score  ", frame.colour = "black", ticks = F)) +
+  boxed_theme(size_sm = 5, size_lg = 6) +
+  theme(axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.ticks.x = element_blank(),
+        legend.key.height = unit(0.25, 'lines'),
+        legend.key.width = unit(0.2, 'lines'))
+p
+```

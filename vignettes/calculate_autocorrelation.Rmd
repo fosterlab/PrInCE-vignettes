@@ -1,0 +1,116 @@
+---
+title: "Identifying rewired proteins in comparative CF-MS data"
+author: "--"
+output:
+  rmarkdown::html_document:
+    theme: yeti
+---
+
+```{r setup, include=FALSE, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE, root.dir = "~/git/PrInCE-vignettes")
+knitr::opts_knit$set(root.dir = "~/git/PrInCE-vignettes")
+options(stringsAsFactors = F)
+suppressWarnings(suppressPackageStartupMessages({
+  library(tidyverse)
+  library(magrittr)
+  library(PrInCE)
+  library(fgsea)
+}))
+```
+
+```{r echo = FALSE, include=FALSE, message=FALSE, warning=FALSE}
+source("R/theme.R")
+```
+
+This vignette demonstrates the application of the PrInCE function `calculate_autocorrelation` to identify rewired proteins in CF-MS data acquired from human cell lines before and after treatment with RNAse. 
+This data is obtained from Mallam et al., _Cell Reports_ 2019, doi: 10.1016/j.celrep.2019.09.060.
+To validate the biological relevance of these rewired proteins, a gene-set enrichment analysis is performed for known RNA-binding proteins from two databases: AtTRACT (Giudice et al., _Database_ 2016; doi: 10.1093/database/baw035) and RBPDB (Cook et al., _Nucleic Acids Research_ 2011; doi: 10.1093/nar/gkq1069). 
+
+First, we will load the data from Mallam et al.
+Data from human cell lines was obtained from the PRIDE repository (accession PXD014820 and PXD015406) and re-analyzed using MaxQuant (version 1.6.5.0, with default settings, using MaxLFQ for label-free protein quantitation). 
+The MaxQuant output (`proteinGroups.txt` files) was then pre-processed using the script in `R/preprocessing/preprocess-Mallam2019.R`. 
+
+```{r}
+chroms = readRDS("data/Mallam2019/chromatograms.rds")
+names(chroms)
+```
+
+Now, it is straightforward to calculate the autocorrelation for each protein between each pair of conditions.
+This function performs the following operations.
+First, for each individual protein in turn, the Pearson correlation to all other proteins in the dataset is calculated in each condition separately, yielding two vectors of correlation coefficients.
+These two vectors are then correlated to one another to produce an 'autocorrelation.'
+Low autocorrelation values are indicative of proteins whose interaction profiles are rewired between conditions, whereas high autocorrelation values indicate consistent elution profiles.
+
+```{r}
+# PXD014820
+autocor1 = calculate_autocorrelation(chroms[['PXD014820|Ctrl']],
+                                     chroms[['PXD014820|RNAseA']])
+# PXD015406
+autocor2 = calculate_autocorrelation(chroms[['PXD015406|Control']],
+                                     chroms[['PXD015406|RNaseA']])
+# inspect the output
+str(autocor1)
+```
+
+By default, the `calculate_autocorrelation` function will compute the Pearson correlation, but the Spearman or Kendall correlation can be specified instead using the `cor_method` argument.
+Other arguments to `calculate_autocorrelation` allow the user to remove proteins not detected in at least a certain number of fractions in either replicate (`min_fractions`), or to ignore correlations between protein pairs not detected in at least a certain number of overlapping fractions (`min_pairs`). 
+
+Now, we combine the results from each experiment and print some of the most 'rewired' proteins.
+
+```{r}
+autocor_df = data.frame(accession = rep(c('PXD014820', 'PXD015406'), 
+                                        c(length(autocor1), length(autocor2))),
+                        protein = c(names(autocor1), names(autocor2)),
+                        autocor = c(autocor1, autocor2) %>% unname())
+autocor_df %>% arrange(autocor) %>% head()
+```
+
+Several of the top-ranking proteins, such as SRP14, SNRPA1, and SNRPN, are well-known RNA-binding proteins, providing an initial measure of confidence in the autocorrelation approach. 
+
+To validate the method's ability to identify RNA-binding proteins more systematically, we now wish to perform a gene-set enrichment analysis of known RNA-binding proteins on the results of the autocorrelation analysis.
+To achieve this, we begin by loading lists of known human RNA-binding proteins from the AtTRACT and RNABP databases.
+(The raw datasets are preprocessed in the scripts `R/preprocessing/preprocess-AtTRACT.R` and `R/preprocessing/preprocess-RNABP.R`, respectively.)
+
+```{r}
+attract = readRDS("data/AtTRACT/AtTRACT.rds")
+rbpdb = readRDS("data/RBPDB/RBPDB.rds")
+rbps = bind_rows(mutate(attract, source = 'AtTRACT'),
+                 mutate(rbpdb, source = 'RBPDB'))
+sample_n(rbps, 5)
+```
+
+Here, the gene-set enrichment analysis is performed using functions from the package `fgsea` (Korotkevich et al., _bioRxiv_ 2019, doi: 10.1101/060012). 
+
+```{r warning=FALSE, message=FALSE}
+# convert RBPs to a list for fgsea
+pathways = unstack(rbps[, c('Gene', 'source')])
+str(pathways)
+gsea = autocor_df %>%
+  split(.$accession) %>% 
+  # convert to vector for fgsea
+  map(~ setNames(.x$autocor, .x$protein)) %>%
+  # use only 10^5 permutations here
+  map(~ fgsea(pathways, .x, nperm = 10^5, scoreType = 'neg')) %>%
+  bind_rows(.id = 'accession')
+gsea
+```
+
+Both RBP databases display a highly significant enrichment among 'rewired' proteins.
+This can also be visualized by plotting the p-values: 
+
+```{r fig.align='center', fig.width=1.5, fig.height=2.5}
+pos = position_dodge(width = 0.6)
+pal = c(colours.cafe322[5], darken(colours.cafe322[3], 1.1))
+p = gsea %>%
+  mutate(source = paste0(accession, '\nRNase vs. control')) %>%
+  ggplot(aes(x = source, y = -log10(pval), color = pathway)) +
+  geom_hline(aes(yintercept = -log10(0.05)), linetype = 'dotted', size = 0.3) +
+  geom_errorbar(aes(ymin = 0, ymax = -log10(pval)), width = 0, position = pos) +
+  geom_point(size = 0.9, position = pos) +
+  scale_y_continuous(expression(-log[10](P)), limits = c(0, 6.5)) + 
+  scale_color_manual(name = '', values = pal) +
+  boxed_theme(size_sm = 5, size_lg = 6) +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+p
+```
